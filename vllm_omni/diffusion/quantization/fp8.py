@@ -25,6 +25,8 @@ class DiffusionFp8Config(DiffusionQuantizationConfig):
             - "static": Single per-tensor scale (requires calibration)
         weight_block_size: Block size for block-wise weight quantization.
             Format: [block_n, block_k]. If None, uses per-tensor scaling.
+        is_checkpoint_fp8_serialized: Whether checkpoint tensors are already
+            serialized in FP8 with explicit scale tensors.
         ignored_layers: List of layer name patterns to skip quantization.
     """
 
@@ -35,15 +37,17 @@ class DiffusionFp8Config(DiffusionQuantizationConfig):
         self,
         activation_scheme: str = "dynamic",
         weight_block_size: list[int] | None = None,
+        is_checkpoint_fp8_serialized: bool = False,
         ignored_layers: list[str] | None = None,
     ):
         self.activation_scheme = activation_scheme
         self.weight_block_size = weight_block_size
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.ignored_layers = ignored_layers or []
 
         # Create underlying vLLM FP8 config
         self._vllm_config = Fp8Config(
-            is_checkpoint_fp8_serialized=False,  # Online quantization from BF16
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             weight_block_size=weight_block_size,
             ignored_layers=ignored_layers,

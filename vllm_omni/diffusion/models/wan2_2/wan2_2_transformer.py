@@ -38,6 +38,68 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_WAN_CHECKPOINT_PREFIXES = (
+    "model.diffusion_model.",
+    "diffusion_model.",
+)
+
+_WAN_TOP_LEVEL_RENAMES = (
+    ("text_embedding.0.", "condition_embedder.text_embedder.linear_1."),
+    ("text_embedding.2.", "condition_embedder.text_embedder.linear_2."),
+    ("time_embedding.0.", "condition_embedder.time_embedder.linear_1."),
+    ("time_embedding.2.", "condition_embedder.time_embedder.linear_2."),
+    ("time_projection.1.", "condition_embedder.time_proj."),
+    ("img_emb.", "condition_embedder.image_embedder."),
+    ("head.head.", "proj_out."),
+)
+
+_WAN_BLOCK_RENAMES = (
+    (".self_attn.norm_q.", ".attn1.norm_q."),
+    (".self_attn.norm_k.", ".attn1.norm_k."),
+    (".self_attn.q.", ".attn1.to_q."),
+    (".self_attn.k.", ".attn1.to_k."),
+    (".self_attn.v.", ".attn1.to_v."),
+    (".self_attn.o.", ".attn1.to_out.0."),
+    (".cross_attn.norm_k_img.", ".attn2.norm_added_k."),
+    (".cross_attn.k_img.", ".attn2.add_k_proj."),
+    (".cross_attn.v_img.", ".attn2.add_v_proj."),
+    (".cross_attn.norm_q.", ".attn2.norm_q."),
+    (".cross_attn.norm_k.", ".attn2.norm_k."),
+    (".cross_attn.q.", ".attn2.to_q."),
+    (".cross_attn.k.", ".attn2.to_k."),
+    (".cross_attn.v.", ".attn2.to_v."),
+    (".cross_attn.o.", ".attn2.to_out.0."),
+    (".ffn.0.", ".ffn.net.0.proj."),
+    (".ffn.2.", ".ffn.net.2."),
+)
+
+
+def _normalize_wan_transformer_checkpoint_name(name: str) -> str:
+    for prefix in _WAN_CHECKPOINT_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+
+    if name.endswith(".scale_weight"):
+        name = name[: -len(".scale_weight")] + ".weight_scale"
+
+    if name == "head.modulation":
+        return "scale_shift_table"
+    if name.endswith(".modulation") and name.startswith("blocks."):
+        return name[: -len(".modulation")] + ".scale_shift_table"
+
+    for old, new in _WAN_TOP_LEVEL_RENAMES:
+        if name.startswith(old):
+            name = new + name[len(old) :]
+            break
+
+    for old, new in _WAN_BLOCK_RENAMES:
+        if old in name:
+            name = name.replace(old, new)
+
+    return name
+
+
 def apply_rotary_emb_wan(
     hidden_states: torch.Tensor,
     freqs_cos: torch.Tensor,
@@ -659,11 +721,11 @@ class WanTransformerBlock(nn.Module):
             added_kv_proj_dim=added_kv_proj_dim,
             quant_config=quant_config,
         )
-        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
+        self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
         # 3. Feed-forward
         self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim, quant_config=quant_config)
-        self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
         # Scale-shift table for modulation
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -699,12 +761,12 @@ class WanTransformerBlock(nn.Module):
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        norm_hidden_states = self.norm3(hidden_states.float()).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
+        norm_hidden_states = (self.norm2(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
             hidden_states
         )
         ff_output = self.ffn(norm_hidden_states)
@@ -1024,8 +1086,14 @@ class WanTransformer3DModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            name = _normalize_wan_transformer_checkpoint_name(name)
             name = weight_name_remapping.get(name, name)
             original_name = name
+
+            if original_name.endswith(".comfy_quant"):
+                logger.warning(f"Skipping weight {original_name} -> {original_name}")
+                continue
+
             lookup_name = name
 
             # Handle QKV fusion

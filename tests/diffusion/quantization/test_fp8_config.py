@@ -50,7 +50,7 @@ def test_invalid_quantization():
 
 def test_fp8_config_with_custom_params():
     """Test FP8 config with custom parameters."""
-    from vllm_omni.diffusion.quantization import get_diffusion_quant_config
+    from vllm_omni.diffusion.quantization import DiffusionFp8Config, get_diffusion_quant_config
 
     config = get_diffusion_quant_config(
         "fp8",
@@ -58,8 +58,25 @@ def test_fp8_config_with_custom_params():
         ignored_layers=["proj_out"],
     )
     assert config is not None
+    assert isinstance(config, DiffusionFp8Config)
     assert config.activation_scheme == "static"
     assert "proj_out" in config.ignored_layers
+
+
+def test_fp8_config_with_checkpoint_serialized():
+    """Test FP8 config for prequantized checkpoints."""
+    from vllm_omni.diffusion.quantization import DiffusionFp8Config, get_diffusion_quant_config
+
+    config = get_diffusion_quant_config(
+        "fp8",
+        is_checkpoint_fp8_serialized=True,
+    )
+    assert config is not None
+    assert isinstance(config, DiffusionFp8Config)
+    assert config.is_checkpoint_fp8_serialized is True
+    vllm_config = config.get_vllm_quant_config()
+    assert vllm_config is not None
+    assert vllm_config.is_checkpoint_fp8_serialized is True
 
 
 def test_supported_methods():
@@ -72,10 +89,12 @@ def test_supported_methods():
 def test_quantization_integration():
     """Test end-to-end quantization flow through OmniDiffusionConfig."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.quantization import DiffusionFp8Config
 
     # Test with quantization string only
     config = OmniDiffusionConfig(model="test", quantization="fp8")
     assert config.quantization_config is not None
+    assert isinstance(config.quantization_config, DiffusionFp8Config)
     assert config.quantization_config.get_name() == "fp8"
 
     # Test with quantization_config dict
@@ -84,6 +103,7 @@ def test_quantization_integration():
         quantization_config={"method": "fp8", "activation_scheme": "static"},
     )
     assert config2.quantization_config is not None
+    assert isinstance(config2.quantization_config, DiffusionFp8Config)
     assert config2.quantization_config.get_name() == "fp8"
     assert config2.quantization_config.activation_scheme == "static"
 
@@ -131,7 +151,7 @@ def test_fp8_delegates_to_vllm_config():
     assert DiffusionFp8Config.quant_config_cls is Fp8Config
 
     # Test that get_name() delegates to vLLM
-    assert DiffusionFp8Config.get_name() == Fp8Config.get_name()
+    assert DiffusionFp8Config().get_name() == Fp8Config.get_name()
 
     # Test that get_min_capability() delegates to vLLM
     assert DiffusionFp8Config.get_min_capability() == Fp8Config.get_min_capability()

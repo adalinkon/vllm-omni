@@ -25,9 +25,13 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
-from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
+from vllm_omni.diffusion.quantization import DiffusionFp8Config, get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.hf_utils import load_pretrained_component_model
+from vllm_omni.diffusion.utils.hf_utils import (
+    has_local_prequantized_fp8_weights,
+    load_pretrained_component_model,
+    load_pretrained_wan_vae_model,
+)
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -117,6 +121,38 @@ def load_transformer_config(
         except Exception:
             pass
     return {}
+
+
+def get_transformer_quant_config(
+    od_config: OmniDiffusionConfig,
+    model_path: str,
+    *component_specs: tuple[str, str | None],
+) -> QuantizationConfig | None:
+    diffusion_quant_config = od_config.quantization_config
+    if diffusion_quant_config is None:
+        return None
+
+    if (
+        isinstance(diffusion_quant_config, DiffusionFp8Config)
+        and not diffusion_quant_config.is_checkpoint_fp8_serialized
+    ):
+        has_prequantized_fp8 = False
+        for subfolder, component_path in component_specs:
+            source_model, source_subfolder = resolve_component_source(model_path, subfolder, component_path)
+            if has_local_prequantized_fp8_weights(source_model, source_subfolder):
+                has_prequantized_fp8 = True
+                break
+
+        if has_prequantized_fp8:
+            logger.info("Detected prequantized FP8 Wan transformer checkpoint; enabling serialized FP8 loading")
+            diffusion_quant_config = DiffusionFp8Config(
+                activation_scheme=diffusion_quant_config.activation_scheme,
+                weight_block_size=diffusion_quant_config.weight_block_size,
+                is_checkpoint_fp8_serialized=True,
+                ignored_layers=list(diffusion_quant_config.ignored_layers),
+            )
+
+    return get_vllm_quant_config_for_layers(cast(Any, diffusion_quant_config))
 
 
 def create_transformer_from_config(
@@ -339,7 +375,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             local_files_only=text_encoder_load_kwargs["local_files_only"],
         ).to(self.device)
         vae_source, vae_load_kwargs = get_component_load_info(model, "vae", vae_path)
-        self.vae = load_pretrained_component_model(
+        self.vae = load_pretrained_wan_vae_model(
             DistributedAutoencoderKLWan,
             vae_source,
             subfolder=vae_load_kwargs.get("subfolder"),
@@ -349,7 +385,12 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         ).to(self.device)
 
         # Get vLLM quantization config for linear layers
-        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        quant_config = get_transformer_quant_config(
+            od_config,
+            model,
+            ("transformer", transformer_path),
+            ("transformer_2", transformer_2_path),
+        )
 
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:

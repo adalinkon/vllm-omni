@@ -40,13 +40,13 @@ from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     get_component_load_info,
+    get_transformer_quant_config,
     load_transformer_config,
     resolve_component_source,
     retrieve_latents,
 )
-from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.hf_utils import load_pretrained_component_model
+from vllm_omni.diffusion.utils.hf_utils import load_pretrained_component_model, load_pretrained_wan_vae_model
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -194,7 +194,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
 
         # VAE
         vae_source, vae_load_kwargs = get_component_load_info(model, "vae", vae_path)
-        self.vae = load_pretrained_component_model(
+        self.vae = load_pretrained_wan_vae_model(
             AutoencoderKLWan,
             vae_source,
             subfolder=vae_load_kwargs.get("subfolder"),
@@ -204,7 +204,11 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         ).to(self.device)
 
         # Get vLLM quantization config for linear layers
-        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        quant_config = get_transformer_quant_config(
+            od_config,
+            model,
+            ("transformer", transformer_path),
+        )
 
         # Single transformer (TI2V uses dense 5B model, not MoE)
         # Load config from model to get correct dimensions
