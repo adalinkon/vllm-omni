@@ -317,6 +317,10 @@ class DiffusionCacheConfig:
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     model: str | None = None
+    transformer_path: str | None = None
+    transformer_2_path: str | None = None
+    vae_path: str | None = None
+    text_encoder_path: str | None = None
 
     model_class_name: str | None = None
 

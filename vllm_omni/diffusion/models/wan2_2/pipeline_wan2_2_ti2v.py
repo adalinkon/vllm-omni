@@ -39,7 +39,9 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
+    get_component_load_info,
     load_transformer_config,
+    resolve_component_source,
     retrieve_latents,
 )
 from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
@@ -155,13 +157,21 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         dtype = getattr(od_config, "dtype", torch.bfloat16)
 
         model = od_config.model
+        if model is None:
+            raise ValueError("Wan2.2 TI2V pipeline requires a model path or repo ID")
+        transformer_path = od_config.transformer_path
+        vae_path = od_config.vae_path
+        text_encoder_path = od_config.text_encoder_path
         local_files_only = os.path.exists(model)
 
         # Set up weights sources for single transformer
+        transformer_model_or_path, transformer_subfolder = resolve_component_source(
+            model, "transformer", transformer_path
+        )
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
+                model_or_path=transformer_model_or_path,
+                subfolder=transformer_subfolder,
                 revision=None,
                 prefix="transformer.",
                 fall_back_to_pt=True,
@@ -170,13 +180,21 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
 
         # Text encoder
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        text_encoder_source, text_encoder_load_kwargs = get_component_load_info(
+            model, "text_encoder", text_encoder_path
+        )
         self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            text_encoder_source,
+            torch_dtype=dtype,
+            **text_encoder_load_kwargs,
         ).to(self.device)
 
         # VAE
+        vae_source, vae_load_kwargs = get_component_load_info(model, "vae", vae_path)
         self.vae = AutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            vae_source,
+            torch_dtype=torch.float32,
+            **vae_load_kwargs,
         ).to(self.device)
 
         # Get vLLM quantization config for linear layers
@@ -184,7 +202,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
 
         # Single transformer (TI2V uses dense 5B model, not MoE)
         # Load config from model to get correct dimensions
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        transformer_config = load_transformer_config(
+            model, "transformer", local_files_only, component_path=transformer_path
+        )
         self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
 
         # Initialize UniPC scheduler

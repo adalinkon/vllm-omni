@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
 import time
 import uuid
 from collections.abc import Sequence
@@ -15,6 +17,22 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _load_primary_transformer_config(od_config: OmniDiffusionConfig) -> dict | None:
+    transformer_source = od_config.transformer_path or od_config.transformer_2_path
+    if transformer_source and os.path.isdir(transformer_source):
+        config_path = os.path.join(transformer_source, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                return json.load(f)
+        return None
+
+    config_file = "config.json" if transformer_source else "transformer/config.json"
+    model_or_path = transformer_source or od_config.model
+    if model_or_path is None:
+        return None
+    return get_hf_file_to_dict(config_file, model_or_path)
 
 
 class OmniDiffusion:
@@ -66,10 +84,9 @@ class OmniDiffusion:
                     od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
 
-                tf_config_dict = get_hf_file_to_dict(
-                    "transformer/config.json",
-                    od_config.model,
-                )
+                tf_config_dict = _load_primary_transformer_config(od_config)
+                if tf_config_dict is None:
+                    raise FileNotFoundError("transformer config.json not found")
                 od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
             else:
                 raise FileNotFoundError("model_index.json not found")

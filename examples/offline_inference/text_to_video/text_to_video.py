@@ -134,6 +134,30 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
+        "--transformer-path",
+        type=str,
+        default=None,
+        help="Override path or repo ID for the primary transformer component.",
+    )
+    parser.add_argument(
+        "--transformer-2-path",
+        type=str,
+        default=None,
+        help="Override path or repo ID for the secondary Wan2.2 transformer component.",
+    )
+    parser.add_argument(
+        "--vae-path",
+        type=str,
+        default=None,
+        help="Override path or repo ID for the VAE component.",
+    )
+    parser.add_argument(
+        "--text-encoder-path",
+        type=str,
+        default=None,
+        help="Override path or repo ID for the text encoder component.",
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
         default=None,
@@ -213,6 +237,10 @@ def main():
         enforce_eager=args.enforce_eager,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        transformer_path=args.transformer_path,
+        transformer_2_path=args.transformer_2_path,
+        vae_path=args.vae_path,
+        text_encoder_path=args.text_encoder_path,
         **quant_kwargs,
     )
 
@@ -231,6 +259,14 @@ def main():
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
         f" vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}"
     )
+    if args.transformer_path:
+        print(f"  Transformer path: {args.transformer_path}")
+    if args.transformer_2_path:
+        print(f"  Transformer 2 path: {args.transformer_2_path}")
+    if args.vae_path:
+        print(f"  VAE path: {args.vae_path}")
+    if args.text_encoder_path:
+        print(f"  Text encoder path: {args.text_encoder_path}")
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")

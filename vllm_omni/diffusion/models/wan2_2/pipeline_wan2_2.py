@@ -55,21 +55,61 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
+def resolve_component_source(
+    model_path: str,
+    subfolder: str,
+    component_path: str | None = None,
+) -> tuple[str, str | None]:
+    if component_path:
+        return component_path, None
+    return model_path, subfolder
+
+
+def get_component_load_info(
+    model_path: str,
+    subfolder: str,
+    component_path: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    source_model, source_subfolder = resolve_component_source(model_path, subfolder, component_path)
+    load_kwargs: dict[str, Any] = {"local_files_only": os.path.exists(source_model)}
+    if source_subfolder is not None:
+        load_kwargs["subfolder"] = source_subfolder
+    return source_model, load_kwargs
+
+
+def load_transformer_config(
+    model_path: str,
+    subfolder: str = "transformer",
+    local_files_only: bool = True,
+    component_path: str | None = None,
+) -> dict:
     """Load transformer config from model directory or HF Hub."""
-    if local_files_only:
+    source_model, source_subfolder = resolve_component_source(model_path, subfolder, component_path)
+    config_filename = "config.json" if source_subfolder is None else f"{source_subfolder}/config.json"
+
+    if os.path.isdir(source_model):
+        config_path = (
+            os.path.join(source_model, "config.json")
+            if source_subfolder is None
+            else os.path.join(source_model, source_subfolder, "config.json")
+        )
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                return json.load(f)
+    elif local_files_only:
         config_path = os.path.join(model_path, subfolder, "config.json")
         if os.path.exists(config_path):
             with open(config_path) as f:
                 return json.load(f)
-    else:
+
+    if not local_files_only or component_path is not None:
         # Try to download config from HF Hub
         try:
             from huggingface_hub import hf_hub_download
 
             config_path = hf_hub_download(
-                repo_id=model_path,
-                filename=f"{subfolder}/config.json",
+                repo_id=source_model,
+                filename=config_filename,
             )
             with open(config_path) as f:
                 return json.load(f)
@@ -211,6 +251,12 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         dtype = getattr(od_config, "dtype", torch.bfloat16)
 
         model = od_config.model
+        if model is None:
+            raise ValueError("Wan2.2 pipeline requires a model path or repo ID")
+        transformer_path = od_config.transformer_path
+        transformer_2_path = od_config.transformer_2_path
+        vae_path = od_config.vae_path
+        text_encoder_path = od_config.text_encoder_path
         local_files_only = os.path.exists(model)
 
         # Read model_index.json to detect expand_timesteps mode (for TI2V-5B)
@@ -223,8 +269,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
             # Check if this is a two-stage model (MoE with transformer_2)
-            transformer_2_path = os.path.join(model, "transformer_2")
-            self.has_transformer_2 = os.path.exists(transformer_2_path)
+            transformer_2_dir = os.path.join(model, "transformer_2")
+            self.has_transformer_2 = bool(transformer_2_path) or os.path.exists(transformer_2_dir)
         else:
             # For remote models, download and read model_index.json
             try:
@@ -236,7 +282,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
                     # Check transformer_2 from model_index
                     transformer_2_info = model_index.get("transformer_2", [None, None])
-                    self.has_transformer_2 = transformer_2_info[0] is not None
+                    self.has_transformer_2 = bool(transformer_2_path) or transformer_2_info[0] is not None
             except Exception:
                 pass
 
@@ -254,20 +300,26 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         # Set up weights sources for transformer(s)
         self.weights_sources = []
         if load_transformer:
+            transformer_model_or_path, transformer_subfolder = resolve_component_source(
+                model, "transformer", transformer_path
+            )
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=od_config.model,
-                    subfolder="transformer",
+                    model_or_path=transformer_model_or_path,
+                    subfolder=transformer_subfolder,
                     revision=None,
                     prefix="transformer.",
                     fall_back_to_pt=True,
                 )
             )
         if load_transformer_2:
+            transformer_2_model_or_path, transformer_2_subfolder = resolve_component_source(
+                model, "transformer_2", transformer_2_path
+            )
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=od_config.model,
-                    subfolder="transformer_2",
+                    model_or_path=transformer_2_model_or_path,
+                    subfolder=transformer_2_subfolder,
                     revision=None,
                     prefix="transformer_2.",
                     fall_back_to_pt=True,
@@ -275,11 +327,19 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        text_encoder_source, text_encoder_load_kwargs = get_component_load_info(
+            model, "text_encoder", text_encoder_path
+        )
         self.text_encoder = UMT5EncoderModel.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
+            text_encoder_source,
+            torch_dtype=dtype,
+            **text_encoder_load_kwargs,
         ).to(self.device)
+        vae_source, vae_load_kwargs = get_component_load_info(model, "vae", vae_path)
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            vae_source,
+            torch_dtype=torch.float32,
+            **vae_load_kwargs,
         ).to(self.device)
 
         # Get vLLM quantization config for linear layers
@@ -287,13 +347,17 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
-            transformer_config = load_transformer_config(model, "transformer", local_files_only)
+            transformer_config = load_transformer_config(
+                model, "transformer", local_files_only, component_path=transformer_path
+            )
             self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
         else:
             self.transformer = None
 
         if load_transformer_2:
-            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
+            transformer_2_config = load_transformer_config(
+                model, "transformer_2", local_files_only, component_path=transformer_2_path
+            )
             self.transformer_2 = create_transformer_from_config(transformer_2_config, quant_config=quant_config)
         else:
             self.transformer_2 = None
