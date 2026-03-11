@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 )
 from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.hf_utils import load_pretrained_component_model
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -183,18 +184,23 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         text_encoder_source, text_encoder_load_kwargs = get_component_load_info(
             model, "text_encoder", text_encoder_path
         )
-        self.text_encoder = UMT5EncoderModel.from_pretrained(
+        self.text_encoder = load_pretrained_component_model(
+            UMT5EncoderModel,
             text_encoder_source,
+            subfolder=text_encoder_load_kwargs.get("subfolder"),
             torch_dtype=dtype,
-            **text_encoder_load_kwargs,
+            local_files_only=text_encoder_load_kwargs["local_files_only"],
         ).to(self.device)
 
         # VAE
         vae_source, vae_load_kwargs = get_component_load_info(model, "vae", vae_path)
-        self.vae = AutoencoderKLWan.from_pretrained(
+        self.vae = load_pretrained_component_model(
+            AutoencoderKLWan,
             vae_source,
+            subfolder=vae_load_kwargs.get("subfolder"),
+            index_file_name="diffusion_pytorch_model.safetensors.index.json",
             torch_dtype=torch.float32,
-            **vae_load_kwargs,
+            local_files_only=vae_load_kwargs["local_files_only"],
         ).to(self.device)
 
         # Get vLLM quantization config for linear layers

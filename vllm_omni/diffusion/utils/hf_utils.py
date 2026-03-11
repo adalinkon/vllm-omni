@@ -1,10 +1,93 @@
+from __future__ import annotations
+
+import glob
+import json
 import os
+import shutil
+import tempfile
 from functools import lru_cache
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
 logger = init_logger(__name__)
+
+
+def get_local_or_hf_file_to_dict(file_name: str, model_name_or_path: str | None) -> dict | None:
+    if model_name_or_path is None:
+        return None
+
+    if os.path.isdir(model_name_or_path):
+        local_path = os.path.join(model_name_or_path, file_name)
+        if not os.path.exists(local_path):
+            return None
+        with open(local_path) as f:
+            return json.load(f)
+
+    return get_hf_file_to_dict(file_name, model_name_or_path)
+
+
+def _link_or_copy_file(src: str, dst: str) -> None:
+    try:
+        os.symlink(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _write_safetensors_index(shard_paths: list[str], index_path: str) -> None:
+    from safetensors import safe_open
+
+    weight_map: dict[str, str] = {}
+    total_size = 0
+    for shard_path in shard_paths:
+        shard_name = os.path.basename(shard_path)
+        total_size += os.path.getsize(shard_path)
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                weight_map[key] = shard_name
+
+    with open(index_path, "w") as f:
+        json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f)
+
+
+def load_pretrained_component_model(
+    model_cls: Any,
+    model_name_or_path: str,
+    *,
+    subfolder: str | None = None,
+    config_file_name: str = "config.json",
+    index_file_name: str = "model.safetensors.index.json",
+    **kwargs: Any,
+) -> Any:
+    component_dir = os.path.join(model_name_or_path, subfolder) if subfolder is not None else model_name_or_path
+    if not os.path.isdir(component_dir):
+        return model_cls.from_pretrained(model_name_or_path, subfolder=subfolder, **kwargs)
+
+    standard_single_file = index_file_name.removesuffix(".index.json")
+    shard_paths = sorted(glob.glob(os.path.join(component_dir, "*.safetensors")))
+    if (
+        not shard_paths
+        or os.path.exists(os.path.join(component_dir, index_file_name))
+        or os.path.exists(os.path.join(component_dir, standard_single_file))
+    ):
+        return model_cls.from_pretrained(model_name_or_path, subfolder=subfolder, **kwargs)
+
+    config_path = os.path.join(component_dir, config_file_name)
+    if not os.path.exists(config_path):
+        return model_cls.from_pretrained(model_name_or_path, subfolder=subfolder, **kwargs)
+
+    logger.info("Synthesizing %s for local component %s", index_file_name, component_dir)
+    forwarded_kwargs = dict(kwargs)
+    forwarded_kwargs.pop("subfolder", None)
+    forwarded_kwargs["local_files_only"] = True
+
+    with tempfile.TemporaryDirectory(prefix="vllm_omni_component_") as temp_dir:
+        _link_or_copy_file(config_path, os.path.join(temp_dir, config_file_name))
+        for shard_path in shard_paths:
+            _link_or_copy_file(shard_path, os.path.join(temp_dir, os.path.basename(shard_path)))
+        _write_safetensors_index(shard_paths, os.path.join(temp_dir, index_file_name))
+        return model_cls.from_pretrained(temp_dir, **forwarded_kwargs)
 
 
 def load_diffusers_config(model_name) -> dict:
@@ -17,7 +100,9 @@ def load_diffusers_config(model_name) -> dict:
 def _looks_like_bagel(model_name: str) -> bool:
     """Best-effort detection for Bagel (non-diffusers) diffusion models."""
     try:
-        cfg = get_hf_file_to_dict("config.json", model_name)
+        cfg = get_local_or_hf_file_to_dict("config.json", model_name)
+        if cfg is None:
+            return False
         model_type = cfg.get("model_type")
         if model_type == "bagel":
             return True
@@ -53,7 +138,7 @@ def is_diffusion_model(model_name: str) -> bool:
 
     # Strategy 2: Check using vllm's utility (works for both local and remote models)
     try:
-        config_dict = get_hf_file_to_dict("model_index.json", model_name)
+        config_dict = get_local_or_hf_file_to_dict("model_index.json", model_name)
         if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
             logger.debug("Detected diffusion model via model_index.json")
             return True

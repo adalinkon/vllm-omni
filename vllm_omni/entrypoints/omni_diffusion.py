@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
-import os
 import time
 import uuid
 from collections.abc import Sequence
 
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.hf_utils import get_local_or_hf_file_to_dict
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -21,18 +19,9 @@ logger = init_logger(__name__)
 
 def _load_primary_transformer_config(od_config: OmniDiffusionConfig) -> dict | None:
     transformer_source = od_config.transformer_path or od_config.transformer_2_path
-    if transformer_source and os.path.isdir(transformer_source):
-        config_path = os.path.join(transformer_source, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                return json.load(f)
-        return None
-
     config_file = "config.json" if transformer_source else "transformer/config.json"
     model_or_path = transformer_source or od_config.model
-    if model_or_path is None:
-        return None
-    return get_hf_file_to_dict(config_file, model_or_path)
+    return get_local_or_hf_file_to_dict(config_file, model_or_path)
 
 
 class OmniDiffusion:
@@ -75,7 +64,7 @@ class OmniDiffusion:
         # Non-diffusers models (e.g. Bagel, NextStep, GLM-Image) only have `config.json`,
         # so we fall back to reading that and mapping model_type manually.
         try:
-            config_dict = get_hf_file_to_dict(
+            config_dict = get_local_or_hf_file_to_dict(
                 "model_index.json",
                 od_config.model,
             )
@@ -91,7 +80,7 @@ class OmniDiffusion:
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
-            cfg = get_hf_file_to_dict("config.json", od_config.model)
+            cfg = get_local_or_hf_file_to_dict("config.json", od_config.model)
             if cfg is None:
                 raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
